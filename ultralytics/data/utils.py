@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import csv
 import json
 import os
 import random
 import subprocess
 import time
 import zipfile
+from collections import Counter
 from multiprocessing.pool import ThreadPool
 from pathlib import Path
 from tarfile import is_tarfile
@@ -55,6 +57,20 @@ IMG_FORMATS = {
 }
 VID_FORMATS = {"asf", "avi", "gif", "m4v", "mkv", "mov", "mp4", "mpeg", "mpg", "ts", "wmv", "webm"}  # videos
 FORMATS_HELP_MSG = f"Supported formats are:\nimages: {IMG_FORMATS}\nvideos: {VID_FORMATS}"
+CSV_DATASET_COLUMNS = (
+    "file_path",
+    "x_center_yo",
+    "y_center_yo",
+    "width_yo",
+    "height_yo",
+    "cls_id",
+    "cls_name",
+    "split",
+    "bbox_exists",
+)  # required columns of a CSV detection dataset, one row per bounding box
+CSV_DATASET_SPLITS = ("train", "val", "test")
+CSV_TRUE_VALUES = frozenset({"1", "1.0", "true", "t", "yes", "y"})  # 'bbox_exists' values, case-insensitive
+CSV_FALSE_VALUES = frozenset({"0", "0.0", "false", "f", "no", "n"})
 
 
 def img2label_paths(img_paths: list[str]) -> list[str]:
@@ -192,6 +208,24 @@ def verify_image(args: tuple) -> tuple:
     return (im_file, cls), nf, nc, msg
 
 
+def _verify_image_file(im_file: str, prefix: str = "") -> tuple[tuple[int, int], str]:
+    """Verify one image file, restoring corrupt JPEGs, and return its (height, width) shape and a message."""
+    msg = ""
+    im = Image.open(im_file)
+    im.verify()  # PIL verify
+    shape = exif_size(im)  # image size
+    shape = (shape[1], shape[0])  # hw
+    assert (shape[0] > 9) & (shape[1] > 9), f"image size {shape} <10 pixels"
+    assert im.format.lower() in IMG_FORMATS, f"invalid image format {im.format}. {FORMATS_HELP_MSG}"
+    if im.format.lower() in {"jpg", "jpeg"}:
+        with open(im_file, "rb") as f:
+            f.seek(-2, 2)
+            if f.read() != b"\xff\xd9":  # corrupt JPEG
+                ImageOps.exif_transpose(Image.open(im_file)).save(im_file, "JPEG", subsampling=0, quality=100)
+                msg = f"{prefix}{im_file}: corrupt JPEG restored and saved"
+    return shape, msg
+
+
 def verify_image_label(args: tuple) -> list:
     """Verify one image-label pair."""
     im_file, lb_file, prefix, keypoint, num_cls, nkpt, ndim, single_cls = args
@@ -199,18 +233,7 @@ def verify_image_label(args: tuple) -> list:
     nm, nf, ne, nc, msg, segments, keypoints = 0, 0, 0, 0, "", [], None
     try:
         # Verify images
-        im = Image.open(im_file)
-        im.verify()  # PIL verify
-        shape = exif_size(im)  # image size
-        shape = (shape[1], shape[0])  # hw
-        assert (shape[0] > 9) & (shape[1] > 9), f"image size {shape} <10 pixels"
-        assert im.format.lower() in IMG_FORMATS, f"invalid image format {im.format}. {FORMATS_HELP_MSG}"
-        if im.format.lower() in {"jpg", "jpeg"}:
-            with open(im_file, "rb") as f:
-                f.seek(-2, 2)
-                if f.read() != b"\xff\xd9":  # corrupt JPEG
-                    ImageOps.exif_transpose(Image.open(im_file)).save(im_file, "JPEG", subsampling=0, quality=100)
-                    msg = f"{prefix}{im_file}: corrupt JPEG restored and saved"
+        shape, msg = _verify_image_file(im_file, prefix)
 
         # Verify labels
         if os.path.isfile(lb_file):
@@ -258,6 +281,44 @@ def verify_image_label(args: tuple) -> list:
                 keypoints = np.concatenate([keypoints, kpt_mask[..., None]], axis=-1)  # (nl, nkpt, 3)
         lb = lb[:, :5]
         return im_file, lb, shape, segments, keypoints, nm, nf, ne, nc, msg
+    except Exception as e:
+        nc = 1
+        msg = f"{prefix}{im_file}: ignoring corrupt image/label: {e}"
+        return [None, None, None, None, None, nm, nf, ne, nc, msg]
+
+
+def verify_image_csv_label(args: tuple) -> list:
+    """Verify one image and its CSV-provided detection labels.
+
+    Args:
+        args (tuple): (im_file, lb, prefix, num_cls, single_cls), where lb is an (n, 5) array of [cls, x, y, w, h] rows
+            with normalized xywh boxes.
+
+    Returns:
+        (list): Same layout as `verify_image_label`: im_file, lb, shape, segments, keypoints, nm, nf, ne, nc, msg.
+    """
+    im_file, lb, prefix, num_cls, single_cls = args
+    nm, nf, ne, nc, msg = 0, 0, 0, 0, ""  # number (missing, found, empty, corrupt), message
+    try:
+        shape, msg = _verify_image_file(im_file, prefix)
+        lb = np.asarray(lb, dtype=np.float32).reshape(-1, 5)
+        if nl := len(lb):
+            nf = 1  # labels found
+            # Coordinate points check with 1% tolerance
+            assert lb[:, 1:].max() <= 1.01, f"non-normalized or out of bounds coordinates {lb[:, 1:][lb[:, 1:] > 1.01]}"
+            assert lb.min() >= -0.01, f"negative class labels or coordinate {lb[lb < -0.01]}"
+            max_cls = 0 if single_cls else lb[:, 0].max()
+            assert max_cls < num_cls, (
+                f"Label class {int(max_cls)} exceeds dataset class count {num_cls}. "
+                f"Possible class labels are 0-{num_cls - 1}"
+            )
+            _, i = np.unique(lb, axis=0, return_index=True)
+            if len(i) < nl:  # duplicate row check
+                lb = lb[np.sort(i)]  # remove duplicates, keep CSV order
+                msg = f"{prefix}{im_file}: {nl - len(i)} duplicate labels removed"
+        else:
+            ne = 1  # background image, no labels
+        return im_file, lb, shape, [], None, nm, nf, ne, nc, msg
     except Exception as e:
         nc = 1
         msg = f"{prefix}{im_file}: ignoring corrupt image/label: {e}"
@@ -425,6 +486,8 @@ def check_det_dataset(dataset: str, autodownload: bool = True) -> dict[str, Any]
         (dict[str, Any]): Parsed dataset information and paths.
     """
     file = Path(check_file(dataset))
+    if file.suffix.lower() == ".csv":
+        return check_csv_dataset(file)
     if file.is_dir():
         file = find_dataset_yaml(file)
 
@@ -504,6 +567,153 @@ def check_det_dataset(dataset: str, autodownload: bool = True) -> dict[str, Any]
     check_font("Arial.ttf" if is_ascii(data["names"]) else "Arial.Unicode.ttf")  # download fonts
 
     return data  # dictionary
+
+
+def _parse_csv_box(values: list[str]) -> list[float]:
+    """Parse CSV [cls_id, x, y, w, h] strings to floats, raising ValueError with the reason if any value is invalid."""
+    if not all(values):
+        raise ValueError(f"'bbox_exists' is true but box or class values are empty in {values}")
+    try:
+        box = [float(v) for v in values]
+    except ValueError:
+        raise ValueError(f"non-numeric value in {values}") from None
+    if not np.isfinite(box).all():
+        raise ValueError(f"non-finite value in {values}")
+    if box[0] < 0 or box[0] != int(box[0]):
+        raise ValueError(f"cls_id '{values[0]}' is not a non-negative integer")
+    return box
+
+
+def parse_csv_dataset(
+    file: str | Path, verbose: bool = True
+) -> tuple[dict[str, dict[str, np.ndarray]], dict[int, str]]:
+    """Parse a CSV detection dataset with one bounding box per row.
+
+    The CSV must contain the columns in `CSV_DATASET_COLUMNS`. Boxes are YOLO-normalized (center x, center y, width,
+    height in 0-1). An image with several objects has several rows with `bbox_exists` true; a background image without
+    objects has a row with `bbox_exists` false, whose box and class columns are ignored. `bbox_exists` accepts
+    `CSV_TRUE_VALUES` and `CSV_FALSE_VALUES`, i.e. true/false, 1/0 or yes/no in any case. `file_path` may be absolute or
+    relative to the CSV file's directory, and `split` must be one of 'train', 'val' or 'test'.
+
+    Invalid rows are ignored with a warning: an unknown split, an invalid `bbox_exists` value, empty, non-numeric or
+    non-finite box values when `bbox_exists` is true, or a `cls_id` that is not a non-negative integer. An ignored row
+    does not add its image to the dataset. A
+    `cls_id` with different `cls_name` values is warned about first and named by its most common name (the first one
+    seen on a tie), keeping all its rows.
+
+    Args:
+        file (str | Path): Path to the CSV file.
+        verbose (bool): Whether to log warnings about conflicting class names, ignored rows and unnamed classes.
+
+    Returns:
+        splits (dict[str, dict[str, np.ndarray]]): Mapping of split name to {image path: (n, 5) [cls, x, y, w, h]
+            float32 array}, in CSV order.
+        names (dict[int, str]): Class names indexed by class ID.
+
+    Raises:
+        ValueError: If columns are missing, a `file_path` is empty, an image is listed in more than one split, or no
+            valid boxes are found.
+
+    Examples:
+        >>> splits, names = parse_csv_dataset("path/to/dataset.csv")
+        >>> labels = splits["train"]["path/to/image.jpg"]  # (n, 5) array
+    """
+    file = Path(file)
+    root = file.absolute().parent
+    box_columns = ("cls_id", "x_center_yo", "y_center_yo", "width_yo", "height_yo")
+    boxes: dict[str, dict[str, list[list[float]]]] = {}
+    image_split: dict[str, str] = {}
+    name_counts: dict[int, Counter] = {}  # cls_id -> Counter of its cls_name values
+    ignored: list[str] = []  # reasons for ignored rows
+    with open(file, encoding="utf-8-sig", newline="") as f:  # utf-8-sig strips a BOM written by Excel
+        reader = csv.DictReader(f)
+        reader.fieldnames = [c.strip() for c in reader.fieldnames or []]
+        if missing := [c for c in CSV_DATASET_COLUMNS if c not in reader.fieldnames]:
+            raise ValueError(f"CSV dataset '{file}' is missing required columns {missing}, found {reader.fieldnames}.")
+        for row in reader:
+            if not any((v or "").strip() for v in row.values() if isinstance(v, str)):
+                continue  # skip blank lines
+            where = f"CSV dataset '{file}' line {reader.line_num}"
+            im_file = (row["file_path"] or "").strip()
+            if not im_file:
+                raise ValueError(f"{where}: empty 'file_path'.")
+            im_file = os.path.normpath(root / Path(im_file).expanduser())  # absolute paths are kept as-is
+            split = (row["split"] or "").strip().lower()
+            if split not in CSV_DATASET_SPLITS:
+                ignored.append(f"line {reader.line_num}: unknown split '{row['split']}'")
+                continue
+            bbox_exists = (row["bbox_exists"] or "").strip().lower()
+            if bbox_exists in CSV_FALSE_VALUES:
+                box = None  # background image row, box and class columns are ignored
+            elif bbox_exists in CSV_TRUE_VALUES:
+                try:
+                    box = _parse_csv_box([(row[c] or "").strip() for c in box_columns])
+                except ValueError as e:
+                    ignored.append(f"line {reader.line_num}: {e}")
+                    continue
+            else:
+                ignored.append(f"line {reader.line_num}: invalid bbox_exists '{row['bbox_exists']}'")
+                continue
+
+            if image_split.setdefault(im_file, split) != split:
+                raise ValueError(f"{where}: image '{im_file}' is in both '{image_split[im_file]}' and '{split}' split.")
+            image_boxes = boxes.setdefault(split, {}).setdefault(im_file, [])
+            if box is None:
+                continue
+            counts = name_counts.setdefault(int(box[0]), Counter())  # register ID even if this row has no name
+            if name := (row["cls_name"] or "").strip():
+                counts[name] += 1
+            image_boxes.append(box)
+
+    names = {c: n.most_common(1)[0][0] if n else "" for c, n in name_counts.items()}  # ties keep first seen
+    if verbose and (conflicts := {c: n for c, n in sorted(name_counts.items()) if len(n) > 1}):
+        shown = "".join(f"\n  cls_id {c}: {dict(n)} -> '{names[c]}'" for c, n in conflicts.items())
+        LOGGER.warning(f"CSV dataset '{file}' has cls_ids with different cls_name values, using most common:{shown}")
+    if ignored and verbose:
+        shown = "\n  ".join(ignored[:10]) + (f"\n  ... and {len(ignored) - 10} more" if len(ignored) > 10 else "")
+        LOGGER.warning(f"CSV dataset '{file}' ignored {len(ignored)} invalid rows:\n  {shown}")
+    if not boxes:
+        raise ValueError(f"CSV dataset '{file}' contains no valid rows.")
+    if not names:
+        raise ValueError(f"CSV dataset '{file}' contains no labeled boxes, at least one class is required.")
+    nc = max(names) + 1
+    if verbose and (unnamed := [i for i in range(nc) if not names.get(i)]):
+        LOGGER.warning(f"CSV dataset '{file}' has no 'cls_name' for class IDs {unnamed}, using 'class_<id>' names.")
+    names = {i: names.get(i) or f"class_{i}" for i in range(nc)}
+    splits = {
+        s: {im: np.array(lb, dtype=np.float32).reshape(-1, 5) for im, lb in boxes[s].items()}
+        for s in CSV_DATASET_SPLITS
+        if s in boxes
+    }
+    return splits, names
+
+
+def check_csv_dataset(file: str | Path) -> dict[str, Any]:
+    """Build a detection dataset dictionary from a CSV dataset file.
+
+    See `parse_csv_dataset` for the CSV format. Each present split ('train', 'val', 'test') becomes a sorted list of
+    image paths, and labels are read from the CSV by `YOLOCSVDataset`.
+
+    Args:
+        file (str | Path): Path to the CSV file.
+
+    Returns:
+        (dict[str, Any]): Dataset dictionary with 'csv_file', 'path', 'names', 'nc', 'channels' and one image path list
+            per present split.
+
+    Examples:
+        >>> data = check_csv_dataset("path/to/dataset.csv")
+        >>> data["names"], len(data["train"])
+    """
+    file = Path(file).resolve()
+    splits, names = parse_csv_dataset(file)
+    for k in "train", "val":
+        if k not in splits:
+            LOGGER.warning(f"CSV dataset '{file}' has no '{k}' rows, '{k}' split is unavailable.")
+    data = {"csv_file": str(file), "path": file.parent, "names": names, "nc": len(names), "channels": 3}
+    data.update({s: sorted(labels) for s, labels in splits.items()})
+    check_font("Arial.ttf" if is_ascii(names) else "Arial.Unicode.ttf")  # download fonts
+    return data
 
 
 def check_cls_dataset(dataset: str | Path, split: str = "") -> dict[str, Any]:

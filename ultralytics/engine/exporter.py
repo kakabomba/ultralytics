@@ -77,7 +77,7 @@ import torch
 from ultralytics import __version__
 from ultralytics.cfg import TASK2CALIBRATIONDATA, TASK2DATA, get_cfg
 from ultralytics.data import build_dataloader
-from ultralytics.data.dataset import YOLODataset
+from ultralytics.data.dataset import YOLOCSVDataset, YOLODataset
 from ultralytics.data.utils import check_cls_dataset, check_det_dataset
 from ultralytics.nn.autobackend import check_class_names, default_class_names
 from ultralytics.nn.modules import C2f, Classify, Detect, RTDETRDecoder, Segment26
@@ -563,7 +563,7 @@ class Exporter:
         """Build and return a dataloader for calibration of INT8 models."""
         LOGGER.info(f"{prefix} collecting INT8 calibration images from 'data={self.args.data}'")
         data = (check_cls_dataset if self.model.task == "classify" else check_det_dataset)(self.args.data)
-        dataset = YOLODataset(
+        dataset = (YOLOCSVDataset if data.get("csv_file") else YOLODataset)(
             data[self.args.split or "val"],
             data=data,
             fraction=self.args.fraction,

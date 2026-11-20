@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections import defaultdict
 from itertools import repeat
@@ -32,13 +33,16 @@ from .augment import (
 from .base import BaseDataset
 from .converter import merge_multi_segment
 from .utils import (
+    CSV_DATASET_SPLITS,
     HELP_URL,
     check_file_speeds,
     get_hash,
     img2label_paths,
     load_dataset_cache_file,
+    parse_csv_dataset,
     save_dataset_cache_file,
     verify_image,
+    verify_image_csv_label,
     verify_image_label,
 )
 
@@ -306,6 +310,167 @@ class YOLODataset(BaseDataset):
             new_batch["batch_idx"][i] += i  # add target image index for build_targets()
         new_batch["batch_idx"] = torch.cat(new_batch["batch_idx"], 0)
         return new_batch
+
+
+class YOLOCSVDataset(YOLODataset):
+    """Detection dataset that reads bounding box labels from a CSV file instead of YOLO *.txt label files.
+
+    The CSV holds one bounding box per row with the columns in `ultralytics.data.utils.CSV_DATASET_COLUMNS`: file_path,
+    x_center_yo, y_center_yo, width_yo, height_yo, cls_id, cls_name, split and bbox_exists, where a row with
+    bbox_exists false marks a background image. Use it by passing the CSV as the dataset, i.e.
+    `model.train(data="dataset.csv")`, which builds the data dictionary with `check_csv_dataset`. Verified labels are
+    cached per split next to the CSV file as '<csv stem>.<split>.cache'.
+
+    Attributes:
+        csv_file (Path): Path to the CSV dataset file.
+
+    Methods:
+        get_img_files: Return the split's image paths listed in the CSV.
+        cache_labels: Verify images and CSV labels, and save them to a cache file.
+        get_labels: Return list of label dictionaries for YOLO training from cache or CSV.
+
+    Examples:
+        >>> from ultralytics.data.utils import check_csv_dataset
+        >>> data = check_csv_dataset("path/to/dataset.csv")
+        >>> dataset = YOLOCSVDataset(img_path=data["train"], data=data, task="detect")
+    """
+
+    def __init__(self, *args, data: dict | None = None, task: str = "detect", **kwargs):
+        """Initialize the YOLOCSVDataset.
+
+        Args:
+            data (dict, optional): Dataset configuration dictionary from `check_csv_dataset`, must contain 'csv_file'.
+            task (str): Task type, only 'detect' is supported.
+            *args (Any): Additional positional arguments for the parent class.
+            **kwargs (Any): Additional keyword arguments for the parent class.
+        """
+        if task != "detect":
+            raise ValueError(f"CSV datasets support only task='detect', but got task='{task}'.")
+        self.csv_file = Path(data["csv_file"])
+        super().__init__(*args, data=data, task=task, **kwargs)
+
+    def get_img_files(self, img_path: str | list[str]) -> list[str]:
+        """Return the image paths of a CSV dataset split.
+
+        Args:
+            img_path (str | list[str]): Image path or list of image paths, i.e. `data["train"]` from
+                `check_csv_dataset`.
+
+        Returns:
+            (list[str]): List of image file paths.
+        """
+        im_files = [str(x) for x in (img_path if isinstance(img_path, (list, tuple)) else [img_path])]
+        if not im_files:
+            raise FileNotFoundError(f"{self.prefix}No images found in {self.csv_file}. {HELP_URL}")
+        if self.fraction < 1:
+            im_files = im_files[: round(len(im_files) * self.fraction)]  # retain a fraction of the dataset
+        check_file_speeds(im_files, prefix=self.prefix)  # check image read speeds
+        return im_files
+
+    def _split_name(self) -> str:
+        """Return the name of the split this dataset was built from, used to name its cache file."""
+        return next((k for k in CSV_DATASET_SPLITS if self.data.get(k) == self.img_path), "custom")
+
+    def _labels_hash(self) -> str:
+        """Return a hash of the CSV contents and the image files, used to invalidate the labels cache."""
+        h = hashlib.sha256(self.csv_file.read_bytes())
+        h.update(get_hash(self.im_files).encode())
+        return h.hexdigest()
+
+    def cache_labels(self, path: Path = Path("./labels.cache")) -> dict:
+        """Verify images and CSV labels, and save them to a cache file.
+
+        Args:
+            path (Path): Path where to save the cache file.
+
+        Returns:
+            (dict): Dictionary containing cached labels and related information.
+        """
+        x = {"labels": []}
+        nm, nf, ne, nc, msgs = 0, 0, 0, 0, []  # number missing, found, empty, corrupt, messages
+        desc = f"{self.prefix}Scanning {self.csv_file}..."
+        splits, _ = parse_csv_dataset(self.csv_file, verbose=False)  # check_csv_dataset already logged warnings
+        csv_labels = {im: lb for labels in splits.values() for im, lb in labels.items()}
+        empty = np.zeros((0, 5), dtype=np.float32)
+        with ThreadPool(NUM_THREADS) as pool:
+            results = pool.imap(
+                func=verify_image_csv_label,
+                iterable=zip(
+                    self.im_files,
+                    (csv_labels.get(im, empty) for im in self.im_files),
+                    repeat(self.prefix),
+                    repeat(len(self.data["names"])),
+                    repeat(self.single_cls),
+                ),
+            )
+            pbar = TQDM(results, desc=desc, total=len(self.im_files))
+            for im_file, lb, shape, segments, keypoint, nm_f, nf_f, ne_f, nc_f, msg in pbar:
+                nm += nm_f
+                nf += nf_f
+                ne += ne_f
+                nc += nc_f
+                if im_file:
+                    x["labels"].append(
+                        {
+                            "im_file": im_file,
+                            "shape": shape,
+                            "cls": lb[:, 0:1],  # n, 1
+                            "bboxes": lb[:, 1:],  # n, 4
+                            "segments": segments,
+                            "keypoints": keypoint,
+                            "normalized": True,
+                            "bbox_format": "xywh",
+                        }
+                    )
+                if msg:
+                    msgs.append(msg)
+                pbar.desc = f"{desc} {nf} images, {nm + ne} backgrounds, {nc} corrupt"
+            pbar.close()
+
+        if msgs:
+            LOGGER.info("\n".join(msgs))
+        if nf == 0:
+            LOGGER.warning(f"{self.prefix}No labels found in {self.csv_file}. {HELP_URL}")
+        x["hash"] = self._labels_hash()
+        x["results"] = nf, nm, ne, nc, len(self.im_files)
+        x["msgs"] = msgs  # warnings
+        if x["labels"]:
+            save_dataset_cache_file(self.prefix, path, x, DATASET_CACHE_VERSION)
+        return x
+
+    def get_labels(self) -> list[dict]:
+        """Return list of label dictionaries for YOLO training, loaded from cache or the CSV file.
+
+        Returns:
+            (list[dict]): List of label dictionaries, each containing information about an image and its annotations.
+        """
+        self.label_files = []  # labels come from the CSV file, not *.txt files
+        cache_path = self.csv_file.with_name(f"{self.csv_file.stem}.{self._split_name()}.cache")
+        try:
+            cache, exists = load_dataset_cache_file(cache_path), True  # attempt to load a *.cache file
+            assert cache["version"] == DATASET_CACHE_VERSION  # matches current version
+            assert cache["hash"] == self._labels_hash()  # identical CSV contents and images
+        except (FileNotFoundError, AssertionError, AttributeError, ModuleNotFoundError):
+            cache, exists = self.cache_labels(cache_path), False  # run cache ops
+
+        # Display cache
+        nf, nm, ne, nc, n = cache.pop("results")  # found, missing, empty, corrupt, total
+        if exists and LOCAL_RANK in {-1, 0}:
+            d = f"Scanning {cache_path}... {nf} images, {nm + ne} backgrounds, {nc} corrupt"
+            TQDM(None, desc=self.prefix + d, total=n, initial=n)  # display results
+            if cache["msgs"]:
+                LOGGER.info("\n".join(cache["msgs"]))  # display warnings
+
+        # Read cache
+        labels = cache["labels"]
+        if not labels:
+            issues = "\n  ".join(sorted(set(cache["msgs"]))) or "no error details"
+            raise RuntimeError(f"No valid images found in {self.csv_file}.\n  {issues}\n{HELP_URL}")
+        [cache.pop(k) for k in ("hash", "version", "msgs")]  # remove items
+        self.im_files = [lb["im_file"] for lb in labels]  # update im_files
+        if not sum(len(lb["cls"]) for lb in labels):
+            LOGGER.warning(f"No boxes found in {self.csv_file}, training may not work correctly. {HELP_URL}")
+        return labels
 
 
 class YOLOMultiModalDataset(YOLODataset):

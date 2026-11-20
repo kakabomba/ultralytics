@@ -18,7 +18,7 @@ from tests import CFG, MODEL, MODELS, SOURCE, SOURCES_LIST, TASK_MODEL_DATA
 from ultralytics import RTDETR, YOLO
 from ultralytics.cfg import TASK2DATA, TASKS
 from ultralytics.data.build import load_inference_source
-from ultralytics.data.utils import check_det_dataset
+from ultralytics.data.utils import check_det_dataset, parse_csv_dataset
 from ultralytics.utils import (
     ARM64,
     ASSETS,
@@ -249,6 +249,55 @@ def test_train_ndjson():
     """Test training the YOLO model using NDJSON format dataset."""
     model = YOLO(WEIGHTS_DIR / "yolo26n.pt")
     model.train(data=f"{ASSETS_URL}/coco8-ndjson.ndjson", epochs=1, imgsz=32)
+
+
+@pytest.mark.skipif(IS_JETSON or IS_RASPBERRYPI, reason="Edge devices not intended for training")
+def test_train_csv(tmp_path):
+    """Test training and validating a YOLO model on a CSV detection dataset with one box per row."""
+    (tmp_path / "images").mkdir()
+    for name in ("bus.jpg", "zidane.jpg"):
+        (tmp_path / "images" / name).write_bytes((ASSETS / name).read_bytes())
+    file = tmp_path / "dataset.csv"
+    columns = ["file_path", "x_center_yo", "y_center_yo", "width_yo", "height_yo", "cls_id", "cls_name", "split"]
+    columns.append("bbox_exists")
+    rows = [
+        ["images/bus.jpg", 0.5, 0.6, 0.9, 0.5, 1, "bus", "train", "True"],  # relative path
+        ["images/bus.jpg", 0.2, 0.6, 0.2, 0.5, 0, "person", "train", 1],
+        [tmp_path / "images" / "zidane.jpg", 0.75, 0.55, 0.3, 0.9, 0, "person", "val", "yes"],  # absolute path
+        [ASSETS / "bus.jpg", 0, 0, 0, 0, 5, "car", "test", "False"],  # background image, box and class ignored
+        # Invalid rows below are ignored
+        ["images/zidane.jpg", 0.5, 0.5, 0.1, 0.1, 0, "person", "unknown", 1],  # unknown split
+        ["images/bus.jpg", 0.5, 0.5, 0.1, 0.1, 0, "person", "train", "maybe"],  # invalid bbox_exists
+        ["images/bus.jpg", 0.5, 0.5, 0.1, 0.1, 0, "person", "train", ""],  # empty bbox_exists
+        ["images/bus.jpg", "", "", "", "", "", "", "train", 1],  # bbox_exists without a box
+        ["images/bus.jpg", 0.5, "", 0.1, 0.1, 0, "person", "train", 1],  # partly filled box
+        ["images/bus.jpg", 0.5, "abc", 0.1, 0.1, 0, "person", "train", 1],  # non-numeric
+        ["images/bus.jpg", 0.5, "nan", 0.1, 0.1, 0, "person", "train", 1],  # non-finite
+        ["images/bus.jpg", 0.5, 0.5, 0.1, 0.1, 1.5, "bus", "train", 1],  # non-integer cls_id
+        ["images/bus.jpg", 0.5, 0.5, 0.1, 0.1, -1, "bus", "train", 1],  # negative cls_id
+        ["images/other.jpg", 0.5, 0.5, 0.1, 0.1, "two", "car", "train", 1],  # non-numeric cls_id, image not added
+        # Conflicting name for cls_id 0 is warned, the most common name 'person' is used
+        [ASSETS / "zidane.jpg", 0.5, 0.5, 0.2, 0.2, 0, "human", "test", 1],
+    ]
+    with open(file, "w", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerows([columns, *rows])
+
+    data = check_det_dataset(file)
+    assert data["names"] == {0: "person", 1: "bus"} and data["nc"] == 2
+    assert data["train"] == [str(tmp_path / "images" / "bus.jpg")]
+    assert len(data["val"]) == 1 and len(data["test"]) == 2
+    splits, _ = parse_csv_dataset(file, verbose=False)
+    assert len(splits["train"][data["train"][0]]) == 2 and len(splits["test"][str(ASSETS / "bus.jpg")]) == 0
+
+    model = YOLO(CFG)
+    model.train(data=file, epochs=1, imgsz=32, batch=2, workers=0, project=tmp_path, name="train")
+    assert (tmp_path / "dataset.train.cache").is_file() and (tmp_path / "dataset.val.cache").is_file()
+    model.val(data=file, split="test", imgsz=32, batch=1, workers=0, project=tmp_path, name="val")
+
+    bad = tmp_path / "bad.csv"
+    bad.write_text(f"{','.join(columns)}\nimages/bus.jpg,0.5,0.5,0.1,0.1,0,a,train,1\nimages/bus.jpg,,,,,,,val,0\n")
+    with pytest.raises(ValueError, match="is in both 'train' and 'val' split"):
+        check_det_dataset(bad)
 
 
 @pytest.mark.parametrize("scls", [False, True])
